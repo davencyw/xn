@@ -50,6 +50,7 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
     }
 }
 
+#[tracing::instrument(name = "qmatmul-by-row", skip_all)]
 fn matmul_by_row<T: GgmlType>(
     lhs_b: &[T::VecDotType],
     rhs_t: &[T],
@@ -707,6 +708,7 @@ impl GgmlType for BlockQ8_0 {
 // sgemm with `(m', n') = (n, m)` and `ldc = n`. Then sgemm's
 // `c[n * i + j]` lines up with `dst[i * n + j]`.
 #[cfg(any(target_feature = "avx", target_feature = "neon", target_feature = "simd128"))]
+#[tracing::instrument(name = "qmatmul-sgemm", skip_all)]
 fn matmul_q8_0_sgemm(
     lhs_b: &[BlockQ8_0],
     rhs_t: &[BlockQ8_0],
@@ -1966,14 +1968,21 @@ pub fn matmul<T: GgmlType>(
         crate::bail!("unexpected lhs length {} {mkn:?}", lhs.len());
     }
 
+    let _span = tracing::info_span!("qmatmul", m, n, k, dtype = ?T::DTYPE).entered();
+
     let k_in_lhs_blocks = k.div_ceil(T::BLCK_SIZE);
     // TODO: Do not make this copy if the DotType is f32.
     // TODO: Pre-allocate this.
     let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_lhs_blocks];
-    for row_idx in 0..m {
-        let lhs_b = &mut lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
-        let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
-        T::VecDotType::from_float(lhs, lhs_b)?
+    {
+        // Quantizing the activations is per-call work that scales with m*k, and it is
+        // allocated fresh every time; keep it separate from the kernel itself.
+        let _span = tracing::info_span!("qmatmul-quantize-lhs").entered();
+        for row_idx in 0..m {
+            let lhs_b = &mut lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
+            let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
+            T::VecDotType::from_float(lhs, lhs_b)?
+        }
     }
     let lhs_b = lhs_b.as_slice();
     T::matmul(lhs_b, rhs_t, dst, m, n, k)?;
