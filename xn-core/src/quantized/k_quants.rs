@@ -698,10 +698,6 @@ impl GgmlType for BlockQ8_0 {
     }
 }
 
-/// Work (in q8_0 blocks: `m * n * k_blocks`) below which the q8_0 matmul runs single-threaded.
-/// Between the largest decode GEMV (~74k) and the smallest prompting GEMM (~1.1M).
-const QGEMM_FANOUT_MIN_BLOCKS: usize = 0;
-
 // Q8_0 matmul backed by the cache-tiling AVX/NEON/simd128 sgemm kernels.
 // The per-thread sgemm dispatch already partitions tiles via `ith`/`nth`,
 // so we just fan out across rayon workers with disjoint tile assignments.
@@ -742,16 +738,10 @@ fn matmul_q8_0_sgemm(
     let a_addr = rhs_t.as_ptr() as usize;
     let b_addr = lhs_b.as_ptr() as usize;
     let c_addr = dst.as_mut_ptr() as usize;
-    // Fanning out costs a rayon fork/join, and that is only worth it once there is enough work
-    // to amortize it. Single-token decode GEMVs land at 18k-74k blocks of work and measure
-    // faster run serially -- markedly so when the pool is shared with other threads, which is
-    // the normal case when generation and audio decoding are pipelined. Prompting GEMMs are
-    // 1.1M blocks and up and still want the fan-out.
-    let nth = if m * n * k_blocks < QGEMM_FANOUT_MIN_BLOCKS {
-        1
-    } else {
-        rayon::current_num_threads().max(1)
-    };
+    // Gating the fan-out on a work threshold was measured and rejected: it helps only when the
+    // pool is shared with another busy thread, and costs ~3.4% otherwise. With a single-worker
+    // pool there is still nothing to fan out to, so call the kernel directly and skip the join.
+    let nth = rayon::current_num_threads().max(1);
     if nth == 1 {
         unsafe {
             #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
