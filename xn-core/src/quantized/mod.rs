@@ -287,7 +287,8 @@ impl QTensor {
         }
         let mut storage = QStorage::Cpu(dtype.cpu_zeros(elem_count));
         storage.quantize(src)?;
-        Ok(Self { storage, shape: shape.clone() })
+        // Weights built in process get the same treatment as weights read from a file.
+        Ok(repack::maybe_interleave(Self { storage, shape: shape.clone() }))
     }
 
     pub fn dtype(&self) -> GgmlDType {
