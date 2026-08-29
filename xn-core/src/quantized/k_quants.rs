@@ -738,8 +738,7 @@ fn matmul_q8_0_sgemm(
     let a_addr = rhs_t.as_ptr() as usize;
     let b_addr = lhs_b.as_ptr() as usize;
     let c_addr = dst.as_mut_ptr() as usize;
-    let nth = rayon::current_num_threads().max(1);
-    (0..nth).into_par_iter().for_each(|ith| {
+    crate::threadpool::dispatch(|ith, nth| {
         // SAFETY: tile assignments are disjoint across `ith` values, so
         // writes through `c_addr` do not alias. Bounds were checked
         // above against the slice lengths.
