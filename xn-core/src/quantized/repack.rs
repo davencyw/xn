@@ -21,7 +21,6 @@ use super::GgmlDType;
 use super::k_quants::{BlockQ8_0, GgmlType, QK8_0};
 use crate::Result;
 use half::f16;
-use rayon::prelude::*;
 use std::borrow::Cow;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -249,7 +248,7 @@ fn matmul_interleaved(
     kb: usize,
 ) {
     let ngroups = n / NCOLS;
-    let nth = rayon::current_num_threads().max(1);
+    let nth = crate::threadpool::size();
 
     // Each worker owns a contiguous run of column groups, so it walks one unbroken span of the
     // weight buffer and writes a disjoint set of dst columns.
@@ -268,16 +267,12 @@ fn matmul_interleaved(
         unsafe { job.run(0, ngroups) };
         return;
     }
-    let duty = ngroups.div_ceil(nth);
-    (0..nth).into_par_iter().for_each(|ith| {
-        let g0 = (duty * ith).min(ngroups);
-        let g1 = (g0 + duty).min(ngroups);
-        if g0 == g1 {
-            return;
-        }
-        // SAFETY: the `[g0, g1)` ranges are disjoint across `ith`, so the columns written
-        // through `job.c` never alias. Bounds were checked by the caller.
-        unsafe { job.run(g0, g1) };
+    // Column groups are handed out on demand rather than split evenly: on a hybrid CPU an
+    // equal split makes every matmul wait for the slowest core.
+    crate::threadpool::par_units(ngroups, |g| {
+        // SAFETY: each group goes to exactly one worker, so the columns written through
+        // `job.c` never alias. Bounds were checked by the caller.
+        unsafe { job.run(g, g + 1) };
     });
 }
 

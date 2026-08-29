@@ -741,7 +741,7 @@ fn matmul_q8_0_sgemm(
     // Gating the fan-out on a work threshold was measured and rejected: it helps only when the
     // pool is shared with another busy thread, and costs ~3.4% otherwise. With a single-worker
     // pool there is still nothing to fan out to, so call the kernel directly and skip the join.
-    let nth = rayon::current_num_threads().max(1);
+    let nth = crate::threadpool::size();
     if nth == 1 {
         unsafe {
             #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
@@ -754,7 +754,7 @@ fn matmul_q8_0_sgemm(
         }
         return Ok(());
     }
-    (0..nth).into_par_iter().for_each(|ith| {
+    crate::threadpool::dispatch(|ith, nth| {
         // SAFETY: tile assignments are disjoint across `ith` values, so
         // writes through `c_addr` do not alias. Bounds were checked
         // above against the slice lengths.

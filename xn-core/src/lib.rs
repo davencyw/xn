@@ -16,6 +16,7 @@ pub mod safetensors;
 pub mod shape;
 pub mod streaming;
 pub mod tensor;
+pub mod threadpool;
 pub mod tensor_view;
 pub mod utils;
 
