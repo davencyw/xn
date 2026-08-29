@@ -635,6 +635,12 @@ impl GgmlType for BlockQ8_0 {
         if ys.len() != nb {
             crate::bail!("size mismatch {} {} {}", xs.len(), ys.len(), Self::BLCK_SIZE)
         }
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            super::neon::quantize_row_q8_0(xs, ys);
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
         for (i, ys) in ys.iter_mut().enumerate() {
             let mut amax = 0f32;
             let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
@@ -746,10 +752,17 @@ fn matmul_q8_0_sgemm(
         unsafe {
             #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
             super::neon::sgemm_q8_0_q8_0_raw(
-                n, m, k_blocks,
-                rhs_t.as_ptr(), k_blocks,
-                lhs_b.as_ptr(), k_blocks,
-                dst.as_mut_ptr(), n, 0, 1,
+                n,
+                m,
+                k_blocks,
+                rhs_t.as_ptr(),
+                k_blocks,
+                lhs_b.as_ptr(),
+                k_blocks,
+                dst.as_mut_ptr(),
+                n,
+                0,
+                1,
             );
         }
         return Ok(());
@@ -2124,5 +2137,58 @@ impl GgmlType for f16 {
             *y = x.to_f32()
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod q8_0_quantize_tests {
+    use super::*;
+
+    /// The scalar definition, kept here so the vectorized path has something to be equal to.
+    fn reference(xs: &[f32], ys: &mut [BlockQ8_0]) {
+        for (i, ys) in ys.iter_mut().enumerate() {
+            let mut amax = 0f32;
+            let xs = &xs[i * QK8_0..(i + 1) * QK8_0];
+            for &x in xs.iter() {
+                amax = amax.max(x.abs())
+            }
+            let d = amax / ((1 << 7) - 1) as f32;
+            let id = if d != 0f32 { 1. / d } else { 0. };
+            ys.d = f16::from_f32(d);
+            for (y, &x) in ys.qs.iter_mut().zip(xs.iter()) {
+                *y = f32::round(x * id) as i8
+            }
+        }
+    }
+
+    #[test]
+    fn from_float_matches_the_scalar_definition() {
+        // Ordinary values, an all-zero block (id becomes 0), exact halves that expose the
+        // rounding mode, and a block whose scaled values sit right at the saturation edge.
+        let mut xs: Vec<f32> =
+            (0..QK8_0 * 6).map(|i| ((i * 37 % 211) as f32 - 105.0) / 8.0).collect();
+        for x in xs[QK8_0..2 * QK8_0].iter_mut() {
+            *x = 0.0;
+        }
+        for (j, x) in xs[2 * QK8_0..3 * QK8_0].iter_mut().enumerate() {
+            *x = (j as f32 - 16.0) * 0.5;
+        }
+        for (j, x) in xs[3 * QK8_0..4 * QK8_0].iter_mut().enumerate() {
+            *x = if j == 0 { 127.0 } else { 126.5 };
+        }
+        for (j, x) in xs[4 * QK8_0..5 * QK8_0].iter_mut().enumerate() {
+            *x = if j % 2 == 0 { f32::MIN_POSITIVE } else { -f32::MIN_POSITIVE };
+        }
+
+        let n = xs.len() / QK8_0;
+        let mut want = vec![BlockQ8_0::zeros(); n];
+        let mut got = vec![BlockQ8_0::zeros(); n];
+        reference(&xs, &mut want);
+        BlockQ8_0::from_float(&xs, &mut got).unwrap();
+
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert_eq!(w.d.to_bits(), g.d.to_bits(), "block {i}: scale differs");
+            assert_eq!(w.qs, g.qs, "block {i}: quantized values differ");
+        }
     }
 }

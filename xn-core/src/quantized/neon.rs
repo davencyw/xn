@@ -886,3 +886,51 @@ unsafe fn multiply_accum_with_scale(
     let p2 = vdotq_s32(q2bytes.1, q8bytes.1);
     vaddvq_s32(p1) * aux[is + index] as i32 + vaddvq_s32(p2) * aux[is + 1 + index] as i32
 }
+
+/// `BlockQ8_0::from_float` for aarch64.
+///
+/// This runs once per matmul on the activation side, so at batch-1 decode it is pure overhead
+/// sitting in front of every projection -- fifty times per token for a 12-layer backbone. The
+/// scalar version does not vectorize: `f32::round(x * id) as i8` lowers to a rounding call plus
+/// a saturating cast per element.
+///
+/// Bit-identical to the scalar path by construction. `vmaxnmq_f32` is FMAXNM, which returns the
+/// non-NaN operand exactly like `f32::max`; plain `vmaxq_f32` would propagate NaN instead.
+/// `vcvtaq_s32_f32` is FCVTAS, round-to-nearest-ties-away, which is what `f32::round` does, and
+/// the paired `vqmovn` narrowing saturates the way `as i8` does.
+#[inline(always)]
+pub(crate) fn quantize_row_q8_0(xs: &[f32], ys: &mut [BlockQ8_0]) {
+    debug_assert_eq!(xs.len(), ys.len() * QK8_0);
+    for (i, y) in ys.iter_mut().enumerate() {
+        let x = &xs[i * QK8_0..(i + 1) * QK8_0];
+        unsafe {
+            let mut v = [vdupq_n_f32(0.0); 8];
+            for (j, v) in v.iter_mut().enumerate() {
+                *v = vld1q_f32(x.as_ptr().add(4 * j));
+            }
+
+            let mut amax = vabsq_f32(v[0]);
+            for v in v.iter().skip(1) {
+                amax = vmaxnmq_f32(amax, vabsq_f32(*v));
+            }
+            let amax = vmaxvq_f32(amax);
+
+            let d = amax / ((1 << 7) - 1) as f32;
+            let id = if d != 0f32 { 1. / d } else { 0. };
+            y.d = half::f16::from_f32(d);
+
+            let idv = vdupq_n_f32(id);
+            // Four f32 lanes -> i32 -> i16 -> i8, two 16-byte stores per block.
+            for half in 0..2 {
+                let q: [int32x4_t; 4] =
+                    std::array::from_fn(|j| vcvtaq_s32_f32(vmulq_f32(v[half * 4 + j], idv)));
+                let lo = vcombine_s16(vqmovn_s32(q[0]), vqmovn_s32(q[1]));
+                let hi = vcombine_s16(vqmovn_s32(q[2]), vqmovn_s32(q[3]));
+                vst1q_s8(
+                    y.qs.as_mut_ptr().add(half * 16),
+                    vcombine_s8(vqmovn_s16(lo), vqmovn_s16(hi)),
+                );
+            }
+        }
+    }
+}

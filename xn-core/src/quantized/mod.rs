@@ -196,6 +196,8 @@ impl GgmlDType {
 // A version of GgmlType without `vec_dot` so that it can be dyn boxed.
 pub trait QuantizedType: Send + Sync {
     fn dtype(&self) -> GgmlDType;
+    /// `dst` is `m * n` row-major and every element must be written: callers are allowed to
+    /// pass uninitialized memory rather than paying for a memset the kernel overwrites anyway.
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()>;
     fn dequantize(&self, elem_count: usize) -> Result<Vec<f32>>;
     fn storage_size_in_bytes(&self) -> usize;
@@ -359,7 +361,14 @@ impl crate::ModuleT for QLinear {
         }
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
-        let mut dst = vec![0.0f32; dst_shape.elem_count()];
+        // SAFETY: `matmul_t` writes every element of `dst` (see its contract), so zeroing it
+        // first is a memset per call that nothing reads -- fifty times a token at decode.
+        let mut dst = unsafe {
+            <crate::CpuDevice as crate::Backend>::alloc_uninit::<f32>(
+                dst_shape.elem_count(),
+                &crate::CpuDevice,
+            )?
+        };
         {
             let xs = xs.storage()?;
             self.weight.matmul_t((dst_shape.elem_count() / n, k, n), &xs, &mut dst)?;
